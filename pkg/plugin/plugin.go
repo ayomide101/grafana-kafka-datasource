@@ -255,11 +255,34 @@ func (d *KafkaDatasource) RunStream(ctx context.Context, req *backend.RunStreamR
 			frame.Fields[0].Set(0, frame_time)
 
 			cnt := 1
-
 			for key, value := range msg.Value {
-				frame.Fields = append(frame.Fields,
-					data.NewField(key, nil, make([]float64, 1)))
-				frame.Fields[cnt].Set(0, value)
+				switch v := value.(type) {
+				case float64:
+					frame.Fields = append(frame.Fields,
+						data.NewField(key, nil, make([]float64, 1)))
+					frame.Fields[cnt].Set(0, v)
+				case string:
+					frame.Fields = append(frame.Fields,
+						data.NewField(key, nil, make([]string, 1)))
+					frame.Fields[cnt].Set(0, v)
+				case bool:
+					frame.Fields = append(frame.Fields,
+						data.NewField(key, nil, make([]bool, 1)))
+					frame.Fields[cnt].Set(0, v)
+				case nil:
+					frame.Fields = append(frame.Fields,
+						data.NewField(key, nil, make([]string, 1)))
+					frame.Fields[cnt].Set(0, "null")
+				default:
+					jsonBytes, err := json.Marshal(v)
+					if err != nil {
+						log.DefaultLogger.Error("Error marshalling complex value", "error", err)
+						continue
+					}
+					frame.Fields = append(frame.Fields,
+						data.NewField(key, nil, make([]string, 1)))
+					frame.Fields[cnt].Set(0, string(jsonBytes))
+				}
 				cnt++
 			}
 

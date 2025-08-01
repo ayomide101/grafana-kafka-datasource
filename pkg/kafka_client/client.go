@@ -71,7 +71,7 @@ type KafkaClient struct {
 }
 
 type KafkaMessage struct {
-	Value     map[string]float64
+	Value     map[string]interface{}
 	Timestamp time.Time
 	Offset    int64
 }
