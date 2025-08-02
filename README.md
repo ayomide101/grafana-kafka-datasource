@@ -48,13 +48,16 @@ For configuration and usage instructions, please refer to the [README.md](src/RE
 
 ## Known limitations
 
-This plugin supports topics publishing very simple JSON formatted messages. Note that only the following structure is supported as of now:
+This plugin supports topics publishing any format of JSON formatted messages. Note that only the following structure is supported as of now:
 
 ```json
 {
     "value1": 1.0,
     "value2": 2,
     "value3": 3.33,
+    "metra": {
+       "foo": "bar"
+    },
     ...
 }
 ```

@@ -1,14 +1,11 @@
 import React, { ChangeEvent, useEffect } from 'react';
-import { InlineField, Input, Divider, SecretInput, Checkbox, SecretTextArea, Select } from '@grafana/ui';
+import { Checkbox, Divider, InlineField, Input, SecretInput, SecretTextArea, Select } from '@grafana/ui';
 import { DataSourcePluginOptionsEditorProps } from '@grafana/data';
-import {
-  ConfigSection,
-  DataSourceDescription,
-} from '@grafana/plugin-ui';
-import { KafkaDataSourceOptions, defaultDataSourceOptions, KafkaSecureJsonData } from './types';
+import { ConfigSection, DataSourceDescription } from '@grafana/plugin-ui';
+import { defaultDataSourceOptions, KafkaDataSourceOptions, KafkaSecureJsonData } from './types';
 import { defaults } from 'lodash';
 
-interface Props extends DataSourcePluginOptionsEditorProps<KafkaDataSourceOptions> { }
+interface Props extends DataSourcePluginOptionsEditorProps<KafkaDataSourceOptions> {}
 
 // Security Protocol options
 const SECURITY_PROTOCOL_OPTIONS = [
@@ -208,13 +205,24 @@ export const ConfigEditor = (props: Props) => {
     onOptionsChange({ ...options, jsonData });
   };
 
+  const onMaxMessagesChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const value = parseInt(event.target.value, 10);
+    // Ensure non-negative values only
+    const validatedValue = isNaN(value) || value < 1 ? 50 : value;
+    const jsonData = {
+      ...options.jsonData,
+      maxMessages: validatedValue,
+    };
+    onOptionsChange({ ...options, jsonData });
+  };
+
   const jsonData = defaults(options.jsonData, defaultDataSourceOptions);
   const secureJsonData = (options.secureJsonData || {}) as KafkaSecureJsonData;
   const { secureJsonFields } = options;
 
   // Check if SASL authentication is required
   const isSaslRequired = jsonData.securityProtocol === 'SASL_PLAINTEXT' || jsonData.securityProtocol === 'SASL_SSL';
-  
+
   // Check if TLS is required (SSL or SASL_SSL)
   const isTlsRequired = jsonData.securityProtocol === 'SSL' || jsonData.securityProtocol === 'SASL_SSL';
 
@@ -225,17 +233,14 @@ export const ConfigEditor = (props: Props) => {
         docsLink="https://github.com/hamedkarbasi93/grafana-kafka-datasource"
         hasRequiredFields={true}
       />
-      
+
       <Divider spacing={4} />
-      
+
       {/* Connection Settings */}
-      <ConfigSection 
-        title="Connection" 
-        description="Configure your Kafka cluster connection settings"
-      >
-        <InlineField 
-          label="Bootstrap Servers" 
-          labelWidth={20} 
+      <ConfigSection title="Connection" description="Configure your Kafka cluster connection settings">
+        <InlineField
+          label="Bootstrap Servers"
+          labelWidth={20}
           tooltip="Kafka bootstrap servers as CSV: host1:9092,host2:9092"
           grow
           required
@@ -249,12 +254,7 @@ export const ConfigEditor = (props: Props) => {
           />
         </InlineField>
 
-        <InlineField 
-          label="Client ID" 
-          labelWidth={20} 
-          tooltip="Custom client identifier (optional)"
-          grow
-        >
+        <InlineField label="Client ID" labelWidth={20} tooltip="Custom client identifier (optional)" grow>
           <Input
             id="config-editor-client-id"
             onChange={onClientIdChange}
@@ -264,24 +264,24 @@ export const ConfigEditor = (props: Props) => {
           />
         </InlineField>
       </ConfigSection>
-      
+
       <Divider spacing={4} />
-      
+
       {/* Security Protocol */}
-      <ConfigSection 
-        title="Security Protocol" 
-        description="Select and enable security layers"
-      >
-        <InlineField 
-          label="Security Protocol" 
-          labelWidth={20} 
+      <ConfigSection title="Security Protocol" description="Select and enable security layers">
+        <InlineField
+          label="Security Protocol"
+          labelWidth={20}
           tooltip="Security protocol for Kafka connection"
           grow
           required
         >
           <Select
             options={SECURITY_PROTOCOL_OPTIONS}
-            value={SECURITY_PROTOCOL_OPTIONS.find(opt => opt.value === options.jsonData?.securityProtocol) || SECURITY_PROTOCOL_OPTIONS[0]}
+            value={
+              SECURITY_PROTOCOL_OPTIONS.find((opt) => opt.value === options.jsonData?.securityProtocol) ||
+              SECURITY_PROTOCOL_OPTIONS[0]
+            }
             onChange={(selected) => {
               const protocol = selected.value || 'PLAINTEXT';
               onOptionsChange({
@@ -297,26 +297,20 @@ export const ConfigEditor = (props: Props) => {
           />
         </InlineField>
       </ConfigSection>
-      
+
       <Divider spacing={4} />
-      
+
       {/* Authentication */}
-      <ConfigSection 
-        title="Authentication" 
-        description="Configure authentication settings"
-      >
+      <ConfigSection title="Authentication" description="Configure authentication settings">
         {isSaslRequired && (
           <>
-            <InlineField 
-              label="SASL Mechanism" 
-              labelWidth={20} 
-              tooltip="SASL authentication mechanism"
-              grow
-              required
-            >
+            <InlineField label="SASL Mechanism" labelWidth={20} tooltip="SASL authentication mechanism" grow required>
               <Select
                 options={SASL_MECHANISM_OPTIONS}
-                value={SASL_MECHANISM_OPTIONS.find(opt => opt.value === jsonData.saslMechanisms) || SASL_MECHANISM_OPTIONS[0]}
+                value={
+                  SASL_MECHANISM_OPTIONS.find((opt) => opt.value === jsonData.saslMechanisms) ||
+                  SASL_MECHANISM_OPTIONS[0]
+                }
                 onChange={(selected) => {
                   const mechanism = selected.value || 'PLAIN';
                   onOptionsChange({
@@ -332,13 +326,7 @@ export const ConfigEditor = (props: Props) => {
               />
             </InlineField>
 
-            <InlineField 
-              label="SASL Username" 
-              labelWidth={20} 
-              tooltip="SASL username for authentication"
-              grow
-              required
-            >
+            <InlineField label="SASL Username" labelWidth={20} tooltip="SASL username for authentication" grow required>
               <Input
                 id="config-editor-sasl-username"
                 onChange={onSaslUsernameChange}
@@ -348,13 +336,7 @@ export const ConfigEditor = (props: Props) => {
               />
             </InlineField>
 
-            <InlineField 
-              label="SASL Password" 
-              labelWidth={20} 
-              tooltip="SASL password for authentication"
-              grow
-              required
-            >
+            <InlineField label="SASL Password" labelWidth={20} tooltip="SASL password for authentication" grow required>
               <SecretInput
                 id="config-editor-sasl-password"
                 isConfigured={(secureJsonFields && secureJsonFields.saslPassword) as boolean}
@@ -372,25 +354,22 @@ export const ConfigEditor = (props: Props) => {
         {isTlsRequired && (
           <>
             <h4 style={{ marginTop: '20px', marginBottom: '10px' }}>TLS Settings</h4>
-            
+
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
-              <Checkbox
-                value={jsonData.tlsSkipVerify || false}
-                onChange={onTlsSkipVerifyChange}
-              />
+              <Checkbox value={jsonData.tlsSkipVerify || false} onChange={onTlsSkipVerifyChange} />
               <label style={{ fontSize: '13px' }}>
                 Skip TLS Verification
-                <span style={{ color: '#888', marginLeft: '4px' }} title="Skip TLS certificate validation (not recommended for production)">
+                <span
+                  style={{ color: '#888', marginLeft: '4px' }}
+                  title="Skip TLS certificate validation (not recommended for production)"
+                >
                   ⓘ
                 </span>
               </label>
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
-              <Checkbox
-                value={jsonData.tlsAuthWithCACert || false}
-                onChange={onTlsAuthWithCACertChange}
-              />
+              <Checkbox value={jsonData.tlsAuthWithCACert || false} onChange={onTlsAuthWithCACertChange} />
               <label style={{ fontSize: '13px' }}>
                 Self-signed Certificate
                 <span style={{ color: '#888', marginLeft: '4px' }} title="Enable if using self-signed certificates">
@@ -401,9 +380,9 @@ export const ConfigEditor = (props: Props) => {
 
             {jsonData.tlsAuthWithCACert && (
               <div style={{ marginLeft: '30px' }}>
-                <InlineField 
-                  label="CA Certificate" 
-                  labelWidth={30} 
+                <InlineField
+                  label="CA Certificate"
+                  labelWidth={30}
                   tooltip="Certificate Authority certificate"
                   htmlFor="config-editor-tls-ca-cert"
                   interactive
@@ -422,10 +401,7 @@ export const ConfigEditor = (props: Props) => {
             )}
 
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
-              <Checkbox
-                value={jsonData.tlsAuth || false}
-                onChange={onTlsClientAuthChange}
-              />
+              <Checkbox value={jsonData.tlsAuth || false} onChange={onTlsClientAuthChange} />
               <label style={{ fontSize: '13px' }}>
                 TLS Client Authentication
                 <span style={{ color: '#888', marginLeft: '4px' }} title="Enable TLS client authentication">
@@ -436,13 +412,7 @@ export const ConfigEditor = (props: Props) => {
 
             {jsonData.tlsAuth && (
               <div style={{ marginLeft: '30px' }}>
-                <InlineField 
-                  label="Server Name" 
-                  labelWidth={30} 
-                  tooltip="Server name for TLS validation"
-                  grow
-                  required
-                >
+                <InlineField label="Server Name" labelWidth={30} tooltip="Server name for TLS validation" grow required>
                   <Input
                     id="config-editor-server-name"
                     onChange={onServerNameChange}
@@ -452,9 +422,9 @@ export const ConfigEditor = (props: Props) => {
                   />
                 </InlineField>
 
-                <InlineField 
-                  label="Client Certificate" 
-                  labelWidth={30} 
+                <InlineField
+                  label="Client Certificate"
+                  labelWidth={30}
                   tooltip="TLS client certificate"
                   htmlFor="client-auth-client-certificate-input"
                   interactive
@@ -470,9 +440,9 @@ export const ConfigEditor = (props: Props) => {
                   />
                 </InlineField>
 
-                <InlineField 
-                  label="Client Key" 
-                  labelWidth={30} 
+                <InlineField
+                  label="Client Key"
+                  labelWidth={30}
                   tooltip="TLS client private key"
                   htmlFor="config-editor-tls-client-key"
                   interactive
@@ -493,7 +463,7 @@ export const ConfigEditor = (props: Props) => {
           </>
         )}
       </ConfigSection>
-      
+
       <Divider spacing={4} />
       {/* Advanced Settings */}
       <ConfigSection
@@ -502,12 +472,7 @@ export const ConfigEditor = (props: Props) => {
         isCollapsible={true}
         isInitiallyOpen={false}
       >
-        <InlineField 
-          label="Log Level" 
-          labelWidth={30} 
-          tooltip="Logging level for debugging"
-          grow
-        >
+        <InlineField label="Log Level" labelWidth={30} tooltip="Logging level for debugging" grow>
           <Input
             id="config-editor-log-level"
             onChange={onLogLevelChange}
@@ -517,9 +482,9 @@ export const ConfigEditor = (props: Props) => {
           />
         </InlineField>
 
-        <InlineField 
-          label="Healthcheck Timeout (ms)" 
-          labelWidth={30} 
+        <InlineField
+          label="Healthcheck Timeout (ms)"
+          labelWidth={30}
           tooltip="Timeout for health check in milliseconds (non-negative values only)"
           grow
         >
@@ -530,6 +495,23 @@ export const ConfigEditor = (props: Props) => {
             type="number"
             step={1}
             min={0}
+            width={40}
+          />
+        </InlineField>
+
+        <InlineField
+          label="Max Messages"
+          labelWidth={30}
+          tooltip="Maximum number of messages to fetch per query or stream (minimum: 1)"
+          grow
+        >
+          <Input
+            id="config-editor-max-messages"
+            onChange={onMaxMessagesChange}
+            value={jsonData.maxMessages}
+            type="number"
+            step={10}
+            min={1}
             width={40}
           />
         </InlineField>

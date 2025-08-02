@@ -1,4 +1,4 @@
-import { DataQuery, DataSourceJsonData } from '@grafana/data';
+import { DataQuery, DataSourceJsonData } from '@grafana/schema';
 
 export enum AutoOffsetReset {
   EARLIEST = 'earliest',
@@ -33,6 +33,8 @@ export interface KafkaDataSourceOptions extends DataSourceJsonData {
   serverName?: string;
   // Advanced HTTP settings
   timeout?: number;
+  // Performance settings
+  maxMessages?: number;
 }
 
 // Default options used when creating a new Kafka datasource
@@ -48,7 +50,8 @@ export const defaultDataSourceOptions: Partial<KafkaDataSourceOptions> = {
   tlsAuth: false,
   tlsSkipVerify: false,
   serverName: '',
-  timeout: 0
+  timeout: 0,
+  maxMessages: 50
 };
 
 export interface KafkaSecureJsonData {
@@ -65,10 +68,16 @@ export interface KafkaQuery extends DataQuery {
   partition: number;
   autoOffsetReset: AutoOffsetReset;
   timestampMode: TimestampMode;
+  streaming: boolean;
+  maxMessages?: number;
+  useTimeRange?: boolean;
 }
 
 export const defaultQuery: Partial<KafkaQuery> = {
   partition: 0,
   autoOffsetReset: AutoOffsetReset.LATEST,
   timestampMode: TimestampMode.Now,
+  streaming: true,
+  useTimeRange: false,
+  // maxMessages is undefined by default to use the data source setting
 };
