@@ -1,4 +1,4 @@
-import { DataQuery, DataSourceJsonData } from '@grafana/data';
+import { DataQuery, DataSourceJsonData } from '@grafana/schema';
 
 export enum AutoOffsetReset {
   EARLIEST = 'earliest',
@@ -70,6 +70,7 @@ export interface KafkaQuery extends DataQuery {
   timestampMode: TimestampMode;
   streaming: boolean;
   maxMessages?: number;
+  useTimeRange?: boolean;
 }
 
 export const defaultQuery: Partial<KafkaQuery> = {
@@ -77,5 +78,6 @@ export const defaultQuery: Partial<KafkaQuery> = {
   autoOffsetReset: AutoOffsetReset.LATEST,
   timestampMode: TimestampMode.Now,
   streaming: true,
+  useTimeRange: false,
   // maxMessages is undefined by default to use the data source setting
 };

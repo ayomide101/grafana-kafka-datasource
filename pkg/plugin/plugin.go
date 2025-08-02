@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
@@ -13,6 +14,7 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 
 	"github.com/hoptical/grafana-kafka-datasource/pkg/kafka_client"
+	"github.com/segmentio/kafka-go"
 )
 
 var (
@@ -120,6 +122,7 @@ type queryModel struct {
 	TimestampMode   string `json:"timestampMode"`
 	Streaming       bool   `json:"streaming"`
 	MaxMessages     *int   `json:"maxMessages,omitempty"`
+	UseTimeRange    bool   `json:"useTimeRange"`
 }
 
 func (d *KafkaDatasource) query(ctx context.Context, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
@@ -164,12 +167,82 @@ func (d *KafkaDatasource) query(ctx context.Context, pCtx backend.PluginContext,
 		return response
 	}
 
-	reader, err := d.client.NewStreamReader(ctx, qm.Topic, qm.Partition, qm.AutoOffsetReset)
-	if err != nil {
-		log.DefaultLogger.Error("Failed to create stream reader", "error", err)
-		response.Error = err
-		return response
+	var reader *kafka.Reader
+
+	// Use time range or auto offset reset based on the query settings
+	if qm.UseTimeRange {
+		timeRangeFrom := query.TimeRange.From
+		timeRangeTo := query.TimeRange.To
+		timeRangeDuration := timeRangeTo.Sub(timeRangeFrom)
+
+		log.DefaultLogger.Debug("Using time range for query",
+			"topic", qm.Topic,
+			"partition", qm.Partition,
+			"from", timeRangeFrom.Format(time.RFC3339),
+			"to", timeRangeTo.Format(time.RFC3339),
+			"duration", timeRangeDuration.String(),
+			"duration_seconds", timeRangeDuration.Seconds())
+
+		// Log the time range in a more human-readable format
+		now := time.Now()
+		log.DefaultLogger.Debug("Time range relative to now",
+			"from_relative", now.Sub(timeRangeFrom).String()+" ago",
+			"to_relative", now.Sub(timeRangeTo).String()+" ago",
+			"now", now.Format(time.RFC3339))
+
+		log.DefaultLogger.Debug("Creating time range reader",
+			"topic", qm.Topic,
+			"partition", qm.Partition,
+			"startTime", timeRangeFrom.Format(time.RFC3339))
+
+		readerCreationStart := time.Now()
+		reader, err = d.client.NewTimeRangeReader(ctx, qm.Topic, qm.Partition, timeRangeFrom)
+		readerCreationDuration := time.Since(readerCreationStart)
+
+		if err != nil {
+			log.DefaultLogger.Error("Failed to create time range reader",
+				"error", err,
+				"topic", qm.Topic,
+				"partition", qm.Partition,
+				"startTime", timeRangeFrom.Format(time.RFC3339),
+				"duration_ms", readerCreationDuration.Milliseconds())
+			response.Error = err
+			return response
+		}
+
+		log.DefaultLogger.Debug("Successfully created time range reader",
+			"topic", qm.Topic,
+			"partition", qm.Partition,
+			"startTime", timeRangeFrom.Format(time.RFC3339),
+			"duration_ms", readerCreationDuration.Milliseconds())
+	} else {
+		log.DefaultLogger.Debug("Using auto offset reset for query",
+			"topic", qm.Topic,
+			"partition", qm.Partition,
+			"autoOffsetReset", qm.AutoOffsetReset)
+
+		readerCreationStart := time.Now()
+		reader, err = d.client.NewStreamReader(ctx, qm.Topic, qm.Partition, qm.AutoOffsetReset)
+		readerCreationDuration := time.Since(readerCreationStart)
+
+		if err != nil {
+			log.DefaultLogger.Error("Failed to create stream reader",
+				"error", err,
+				"topic", qm.Topic,
+				"partition", qm.Partition,
+				"autoOffsetReset", qm.AutoOffsetReset,
+				"duration_ms", readerCreationDuration.Milliseconds())
+			response.Error = err
+			return response
+		}
+
+		log.DefaultLogger.Debug("Successfully created stream reader",
+			"topic", qm.Topic,
+			"partition", qm.Partition,
+			"autoOffsetReset", qm.AutoOffsetReset,
+			"duration_ms", readerCreationDuration.Milliseconds())
 	}
+
 	defer reader.Close()
 
 	frame := data.NewFrame("response")
@@ -200,25 +273,85 @@ func (d *KafkaDatasource) query(ctx context.Context, pCtx backend.PluginContext,
 	allFields := make(map[string]string) // key -> type
 	messages := make([]map[string]interface{}, 0, maxMessages)
 
-	queryTimeout := time.After(2 * time.Second)
+	// Use a longer timeout for time-based queries as they might take longer
+	queryTimeoutDuration := 2 * time.Second
+	if qm.UseTimeRange {
+		queryTimeoutDuration = 10 * time.Second
+		log.DefaultLogger.Debug("Using extended timeout for time-based query",
+			"topic", qm.Topic,
+			"partition", qm.Partition,
+			"from", query.TimeRange.From,
+			"to", query.TimeRange.To,
+			"timeout_seconds", queryTimeoutDuration.Seconds())
+	}
+	queryTimeout := time.After(queryTimeoutDuration)
 	messageCount := 0
 
+	// Log the query parameters for debugging
+	log.DefaultLogger.Debug("Starting query execution",
+		"topic", qm.Topic,
+		"partition", qm.Partition,
+		"maxMessages", maxMessages,
+		"useTimeRange", qm.UseTimeRange,
+		"timeRangeFrom", query.TimeRange.From,
+		"timeRangeTo", query.TimeRange.To)
+
 	// First pass: collect all messages and identify all fields and their types
+	log.DefaultLogger.Debug("Starting message collection loop",
+		"maxMessages", maxMessages,
+		"targetMessages", targetMessages,
+		"minMessages", minMessages,
+		"useTimeRange", qm.UseTimeRange)
+
+	loopStartTime := time.Now()
+	messageProcessingTimes := make([]time.Duration, 0, maxMessages)
+
 	for messageCount < maxMessages {
 		select {
 		case <-queryTimeout:
-			log.DefaultLogger.Debug("Query timeout reached", "messageCount", messageCount)
+			log.DefaultLogger.Debug("Query timeout reached",
+				"messageCount", messageCount,
+				"elapsedTime", time.Since(loopStartTime).String())
 			break
 		default:
-			// Reduce per-message timeout to 100ms
-			msgCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			// Set per-message timeout - longer for time-based queries
+			msgTimeoutDuration := 100 * time.Millisecond
+			if qm.UseTimeRange {
+				msgTimeoutDuration = 500 * time.Millisecond
+			}
+
+			msgStartTime := time.Now()
+			log.DefaultLogger.Debug("Attempting to pull message",
+				"messageCount", messageCount,
+				"timeout", msgTimeoutDuration.String())
+
+			msgCtx, cancel := context.WithTimeout(ctx, msgTimeoutDuration)
 			msg, err := d.client.ConsumerPull(msgCtx, reader)
+			msgDuration := time.Since(msgStartTime)
+			messageProcessingTimes = append(messageProcessingTimes, msgDuration)
 			cancel()
 
 			if err != nil {
-				log.DefaultLogger.Debug("Error or timeout fetching message", "error", err, "messageCount", messageCount)
+				if err == context.DeadlineExceeded {
+					log.DefaultLogger.Debug("Timeout fetching message",
+						"messageCount", messageCount,
+						"duration_ms", msgDuration.Milliseconds(),
+						"timeout_ms", msgTimeoutDuration.Milliseconds())
+				} else {
+					log.DefaultLogger.Error("Error fetching message",
+						"error", err,
+						"messageCount", messageCount,
+						"duration_ms", msgDuration.Milliseconds())
+				}
 				break
 			}
+
+			log.DefaultLogger.Debug("Successfully pulled message",
+				"messageCount", messageCount,
+				"offset", msg.Offset,
+				"timestamp", msg.Timestamp.Format(time.RFC3339),
+				"duration_ms", msgDuration.Milliseconds(),
+				"fieldCount", len(msg.Value))
 
 			var frameTime time.Time
 			if qm.TimestampMode == "now" {
@@ -232,28 +365,51 @@ func (d *KafkaDatasource) query(ctx context.Context, pCtx backend.PluginContext,
 			messages = append(messages, msg.Value)
 
 			// Record all field keys and their types
+			newFieldsFound := 0
 			for key, value := range msg.Value {
 				// Only record the type if we haven't seen this field before
 				// or if we've seen it but it was null
 				if existingType, exists := allFields[key]; !exists || existingType == "" {
+					newFieldsFound++
+					valueType := "unknown"
+
 					switch value.(type) {
 					case float64:
 						allFields[key] = "float64"
+						valueType = "float64"
 					case string:
 						allFields[key] = "string"
+						valueType = "string"
 					case bool:
 						allFields[key] = "bool"
+						valueType = "bool"
 					case nil:
 						// For null values, we'll use string type but mark it as empty
 						// so it can be overridden if we find a non-null value later
 						if !exists {
 							allFields[key] = ""
+							valueType = "null"
 						}
 					default:
 						// For complex types, store as JSON string
 						allFields[key] = "string"
+						valueType = fmt.Sprintf("complex (%T)", value)
+					}
+
+					if newFieldsFound <= 5 { // Limit logging to first 5 new fields to avoid log spam
+						log.DefaultLogger.Debug("New field detected",
+							"messageCount", messageCount,
+							"field", key,
+							"type", valueType)
 					}
 				}
+			}
+
+			if newFieldsFound > 0 {
+				log.DefaultLogger.Debug("Field detection summary",
+					"messageCount", messageCount,
+					"newFieldsFound", newFieldsFound,
+					"totalFieldsCount", len(allFields))
 			}
 
 			messageCount++
@@ -261,23 +417,151 @@ func (d *KafkaDatasource) query(ctx context.Context, pCtx backend.PluginContext,
 			// Early return if we have enough messages for visualization
 			// but ensure we have at least minMessages
 			if messageCount >= targetMessages && messageCount >= minMessages {
-				log.DefaultLogger.Debug("Collected enough messages for visualization", "messageCount", messageCount)
+				log.DefaultLogger.Debug("Collected enough messages for visualization",
+					"messageCount", messageCount,
+					"targetMessages", targetMessages,
+					"minMessages", minMessages,
+					"elapsedTime", time.Since(loopStartTime).String())
 				break
 			}
 		}
 	}
 
-	// If no messages were collected, return early
+	// Calculate message processing statistics
+	loopDuration := time.Since(loopStartTime)
+	var avgProcessingTime time.Duration
+	if len(messageProcessingTimes) > 0 {
+		var totalTime time.Duration
+		for _, t := range messageProcessingTimes {
+			totalTime += t
+		}
+		avgProcessingTime = totalTime / time.Duration(len(messageProcessingTimes))
+	}
+
+	log.DefaultLogger.Debug("Message collection loop completed",
+		"messageCount", messageCount,
+		"totalDuration", loopDuration.String(),
+		"avgMessageProcessingTime", avgProcessingTime.String(),
+		"messagesPerSecond", float64(messageCount)/loopDuration.Seconds())
+
+	// If no messages were collected, return early with a more informative response
 	if len(messages) == 0 {
+		log.DefaultLogger.Info("No messages found in query result",
+			"topic", qm.Topic,
+			"partition", qm.Partition,
+			"useTimeRange", qm.UseTimeRange)
+
+		// Try to get reader stats for debugging
+		stats := reader.Stats()
+		log.DefaultLogger.Debug("Kafka reader stats for empty result",
+			"topic", qm.Topic,
+			"partition", qm.Partition,
+			"offset", stats.Offset,
+			"lag", stats.Lag,
+			"minBytes", stats.MinBytes,
+			"maxBytes", stats.MaxBytes,
+			"maxWait", stats.MaxWait.String(),
+			"dials", stats.Dials,
+			"fetches", stats.Fetches,
+			"messages", stats.Messages,
+			"errors", stats.Errors)
+
+		// Try to get partition information directly
+		// Create a context with timeout for getting partition info
+		partInfoCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+
+		// Try to get the first broker to check partition info
+		firstBroker := strings.Split(d.client.BootstrapServers, ",")[0]
+
+		// Check if Dialer is initialized
+		if d.client.Dialer == nil {
+			log.DefaultLogger.Error("Cannot get partition info, dialer is nil",
+				"topic", qm.Topic,
+				"partition", qm.Partition)
+		} else {
+			conn, dialErr := d.client.Dialer.DialLeader(partInfoCtx, "tcp", firstBroker, qm.Topic, int(qm.Partition))
+
+			if dialErr != nil {
+				log.DefaultLogger.Error("Failed to dial leader for partition info",
+					"error", dialErr,
+					"broker", firstBroker,
+					"topic", qm.Topic,
+					"partition", qm.Partition)
+			} else {
+				defer conn.Close()
+
+				// Try to get partition offsets
+				low, high, readErr := conn.ReadOffsets()
+				if readErr != nil {
+					log.DefaultLogger.Error("Failed to read offsets for partition info",
+						"error", readErr,
+						"topic", qm.Topic,
+						"partition", qm.Partition)
+				} else {
+					messageCount := high - low
+					log.DefaultLogger.Info("Partition information for empty result",
+						"topic", qm.Topic,
+						"partition", qm.Partition,
+						"lowWatermark", low,
+						"highWatermark", high,
+						"messageCount", messageCount)
+
+					if qm.UseTimeRange {
+						log.DefaultLogger.Info("Time range query returned no results",
+							"topic", qm.Topic,
+							"partition", qm.Partition,
+							"from", query.TimeRange.From.Format(time.RFC3339),
+							"to", query.TimeRange.To.Format(time.RFC3339),
+							"lowWatermark", low,
+							"highWatermark", high,
+							"messageCount", messageCount)
+
+						if messageCount == 0 {
+							log.DefaultLogger.Info("Partition is empty, no messages to return")
+						} else {
+							log.DefaultLogger.Info("Partition has messages, but none match the time range",
+								"timeRangeFrom", query.TimeRange.From.Format(time.RFC3339),
+								"timeRangeTo", query.TimeRange.To.Format(time.RFC3339))
+						}
+					}
+				}
+			}
+		}
+
 		frame.Fields = append(frame.Fields,
 			data.NewField("time", nil, []time.Time{query.TimeRange.From, query.TimeRange.To}),
 			data.NewField("values", nil, []int64{0, 0}),
 		)
+
+		frame.Meta = &data.FrameMeta{
+			Notices: []data.Notice{
+				{
+					Severity: data.NoticeSeverityInfo,
+					Text:     fmt.Sprintf("No messages found in topic '%s' partition %d", qm.Topic, qm.Partition),
+				},
+			},
+		}
+
+		if qm.UseTimeRange {
+			frame.Meta.Notices = append(frame.Meta.Notices, data.Notice{
+				Severity: data.NoticeSeverityInfo,
+				Text: fmt.Sprintf("No messages found in the specified time range: %s to %s",
+					query.TimeRange.From.Format(time.RFC3339),
+					query.TimeRange.To.Format(time.RFC3339)),
+			})
+		}
+
 		response.Frames = append(response.Frames, frame)
 
-		// Log query execution time
 		queryDuration := time.Since(startTime)
-		log.DefaultLogger.Debug("Query execution completed with no messages", "duration_ms", queryDuration.Milliseconds())
+		log.DefaultLogger.Debug("Query execution completed with no messages",
+			"topic", qm.Topic,
+			"partition", qm.Partition,
+			"useTimeRange", qm.UseTimeRange,
+			"timeRangeFrom", query.TimeRange.From.Format(time.RFC3339),
+			"timeRangeTo", query.TimeRange.To.Format(time.RFC3339),
+			"duration_ms", queryDuration.Milliseconds())
 
 		return response
 	}
@@ -360,11 +644,35 @@ func (d *KafkaDatasource) query(ctx context.Context, pCtx backend.PluginContext,
 	queryDuration := time.Since(startTime)
 	messagesPerSecond := float64(messageCount) / queryDuration.Seconds()
 
-	log.DefaultLogger.Debug("Query execution completed",
-		"duration_ms", queryDuration.Milliseconds(),
-		"messageCount", messageCount,
-		"messagesPerSecond", messagesPerSecond,
-		"fieldCount", len(allFields))
+	perfMetrics := map[string]interface{}{
+		"duration_ms":       queryDuration.Milliseconds(),
+		"messageCount":      messageCount,
+		"messagesPerSecond": messagesPerSecond,
+		"fieldCount":        len(allFields),
+		"topic":             qm.Topic,
+		"partition":         qm.Partition,
+		"useTimeRange":      qm.UseTimeRange,
+	}
+
+	if qm.UseTimeRange {
+		perfMetrics["timeRangeFrom"] = query.TimeRange.From
+		perfMetrics["timeRangeTo"] = query.TimeRange.To
+		perfMetrics["timeRangeDuration"] = query.TimeRange.To.Sub(query.TimeRange.From).String()
+	}
+
+	// Add metadata to the frame with performance information
+	if frame.Meta == nil {
+		frame.Meta = &data.FrameMeta{}
+	}
+
+	frame.Meta.Notices = append(frame.Meta.Notices, data.Notice{
+		Severity: data.NoticeSeverityInfo,
+		Text: fmt.Sprintf("Query completed in %d ms, processed %d messages (%0.2f msgs/sec)",
+			queryDuration.Milliseconds(), messageCount, messagesPerSecond),
+	})
+
+	// Log detailed performance metrics
+	log.DefaultLogger.Debug("Query execution completed", perfMetrics)
 
 	response.Frames = append(response.Frames, frame)
 	return response

@@ -1,9 +1,9 @@
 import { defaults } from 'lodash';
 import React, { ChangeEvent, PureComponent } from 'react';
-import { Combobox, InlineField, InlineFieldRow, Input, Switch } from '@grafana/ui';
+import { Checkbox, Combobox, InlineField, InlineFieldRow, Input, Switch } from '@grafana/ui';
 import { QueryEditorProps } from '@grafana/data';
 import { DataSource } from './datasource';
-import { defaultQuery, KafkaDataSourceOptions, KafkaQuery, AutoOffsetReset, TimestampMode } from './types';
+import { AutoOffsetReset, defaultQuery, KafkaDataSourceOptions, KafkaQuery, TimestampMode } from './types';
 
 const autoResetOffsets: Array<{ label: string; value: AutoOffsetReset }> = [
   {
@@ -66,19 +66,29 @@ export class QueryEditor extends PureComponent<Props> {
   onMaxMessagesChange = (event: ChangeEvent<HTMLInputElement>) => {
     const { onChange, query, onRunQuery } = this.props;
     const value = parseInt(event.target.value, 10);
-    const maxMessages = (isNaN(value) || value < 1) ? undefined : value;
+    const maxMessages = isNaN(value) || value < 1 ? undefined : value;
     onChange({ ...query, maxMessages });
+    onRunQuery();
+  };
+
+  onUseTimeRangeChanged = (event: React.FormEvent<HTMLInputElement>) => {
+    const { onChange, query, onRunQuery } = this.props;
+    onChange({ ...query, useTimeRange: event.currentTarget.checked });
     onRunQuery();
   };
 
   render() {
     const query = defaults(this.props.query, defaultQuery);
-    const { topicName, partition, autoOffsetReset, timestampMode, streaming, maxMessages } = query;
+    const { topicName, partition, autoOffsetReset, timestampMode, streaming, maxMessages, useTimeRange } = query;
 
     return (
       <>
         <InlineFieldRow>
-          <InlineField label="Topic" labelWidth={10} tooltip="Kafka topic name. Supports Grafana template variables (e.g., $variable or ${variable})">
+          <InlineField
+            label="Topic"
+            labelWidth={10}
+            tooltip="Kafka topic name. Supports Grafana template variables (e.g., $variable or ${variable})"
+          >
             <Input
               id="query-editor-topic"
               value={topicName || ''}
@@ -88,7 +98,11 @@ export class QueryEditor extends PureComponent<Props> {
               placeholder="Enter topic name or use $variable"
             />
           </InlineField>
-          <InlineField label="Partition" labelWidth={10} tooltip="Kafka partition number. Supports Grafana template variables (e.g., $variable or ${variable})">
+          <InlineField
+            label="Partition"
+            labelWidth={10}
+            tooltip="Kafka partition number. Supports Grafana template variables (e.g., $variable or ${variable})"
+          >
             <Input
               id="query-editor-partition"
               value={partition}
@@ -103,36 +117,11 @@ export class QueryEditor extends PureComponent<Props> {
         </InlineFieldRow>
         <InlineFieldRow>
           <InlineField
-            label="Auto offset reset"
+            label="Enable Streaming"
             labelWidth={20}
-            tooltip="Starting offset to consume that can be from latest or last 100."
-          >
-            <Combobox
-              width={22}
-              value={autoOffsetReset}
-              options={autoResetOffsets}
-              onChange={(value) => this.onAutoResetOffsetChanged(value.value!)}
-            />
-          </InlineField>
-          <InlineField label="Timestamp Mode" labelWidth={20} tooltip="Timestamp of the kafka value to visualize.">
-            <Combobox
-              width={25}
-              value={timestampMode}
-              options={timestampModes}
-              onChange={(value) => this.onTimestampModeChanged(value.value!)}
-            />
-          </InlineField>
-        </InlineFieldRow>
-        <InlineFieldRow>
-          <InlineField 
-            label="Enable Streaming" 
-            labelWidth={20} 
             tooltip="Enable continuous streaming of data from Kafka. When disabled, a fixed set of messages will be fetched once."
           >
-            <Switch
-              value={streaming}
-              onChange={this.onStreamingChanged}
-            />
+            <Switch value={streaming} onChange={this.onStreamingChanged} />
           </InlineField>
           <InlineField
             label="Max Messages"
@@ -148,6 +137,63 @@ export class QueryEditor extends PureComponent<Props> {
               min={1}
               step={10}
               placeholder="Default"
+            />
+          </InlineField>
+        </InlineFieldRow>
+
+        {streaming ? (
+          // Show auto offset reset options when streaming is enabled
+          <InlineFieldRow>
+            <InlineField
+              label="Auto offset reset"
+              labelWidth={20}
+              tooltip="Starting offset to consume that can be from latest or last 100."
+            >
+              <Combobox
+                width={22}
+                value={autoOffsetReset}
+                options={autoResetOffsets}
+                onChange={(value) => this.onAutoResetOffsetChanged(value.value!)}
+              />
+            </InlineField>
+          </InlineFieldRow>
+        ) : (
+          // Show time range options when streaming is disabled
+          <InlineFieldRow>
+            <InlineField
+              label="Use Dashboard Time Range"
+              labelWidth="auto"
+              tooltip="When enabled, messages will be fetched based on the dashboard time range. When disabled, auto offset reset will be used."
+            >
+              <Checkbox value={useTimeRange} onChange={this.onUseTimeRangeChanged} label="" />
+            </InlineField>
+
+            {!useTimeRange && (
+              <InlineField
+                label="Auto offset reset"
+                labelWidth="auto"
+                tooltip="Starting offset to consume that can be from latest or last 100."
+              >
+                <Combobox
+                  width={'auto'}
+                  minWidth={22}
+                  value={autoOffsetReset}
+                  options={autoResetOffsets}
+                  onChange={(value) => this.onAutoResetOffsetChanged(value.value!)}
+                />
+              </InlineField>
+            )}
+          </InlineFieldRow>
+        )}
+
+        <InlineFieldRow>
+          <InlineField label="Timestamp Mode" labelWidth="auto" tooltip="Timestamp of the kafka value to visualize.">
+            <Combobox
+              width={'auto'}
+              minWidth={22}
+              value={timestampMode}
+              options={timestampModes}
+              onChange={(value) => this.onTimestampModeChanged(value.value!)}
             />
           </InlineField>
         </InlineFieldRow>

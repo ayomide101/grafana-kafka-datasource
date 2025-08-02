@@ -6,10 +6,10 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
+	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/segmentio/kafka-go/sasl"
 	"github.com/segmentio/kafka-go/sasl/plain"
 	"github.com/segmentio/kafka-go/sasl/scram"
@@ -243,22 +243,227 @@ func (client *KafkaClient) NewStreamReader(
 	return reader, nil
 }
 
+func (client *KafkaClient) NewTimeRangeReader(ctx context.Context, topic string, partition int32, startTime time.Time) (*kafka.Reader, error) {
+	log.DefaultLogger.Debug("Creating time range reader",
+		"topic", topic,
+		"partition", partition,
+		"startTime", startTime.Format(time.RFC3339))
+
+	if client.Dialer == nil {
+		log.DefaultLogger.Debug("Dialer not initialized, creating new connection")
+		if err := client.NewConnection(); err != nil {
+			log.DefaultLogger.Error("Failed to create connection", "error", err)
+			return nil, fmt.Errorf("failed to create connection: %w", err)
+		}
+		log.DefaultLogger.Debug("Connection created successfully")
+	}
+
+	// Create a new reader
+	reader := client.newReader(topic, int(partition))
+	log.DefaultLogger.Debug("Created new reader", "topic", topic, "partition", partition)
+
+	// Create a context with a timeout for the SetOffsetAt call
+	// Use a longer timeout (10 seconds) for time-based queries as they might take longer
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	log.DefaultLogger.Debug("Using extended timeout for time-based query", "timeout_seconds", 10)
+
+	// First check if the topic has any messages
+	firstBroker := strings.Split(client.BootstrapServers, ",")[0]
+	log.DefaultLogger.Debug("Dialing leader to check topic", "broker", firstBroker, "topic", topic, "partition", partition)
+	conn, dialErr := client.Dialer.DialLeader(timeoutCtx, network, firstBroker, topic, int(partition))
+	if dialErr != nil {
+		reader.Close()
+		log.DefaultLogger.Error("Unable to dial leader to check topic", "error", dialErr, "broker", firstBroker)
+		return nil, fmt.Errorf("unable to dial leader to check topic: %w", dialErr)
+	}
+
+	// Get the current offset range
+	log.DefaultLogger.Debug("Reading offsets", "topic", topic, "partition", partition)
+	low, high, readErr := conn.ReadOffsets()
+	if readErr != nil {
+		conn.Close()
+		reader.Close()
+		log.DefaultLogger.Error("Unable to read offsets", "error", readErr, "topic", topic, "partition", partition)
+		return nil, fmt.Errorf("unable to read offsets: %w", readErr)
+	}
+	conn.Close()
+	log.DefaultLogger.Debug("Read offsets successfully",
+		"topic", topic,
+		"partition", partition,
+		"low", low,
+		"high", high,
+		"messageCount", high-low)
+
+	// Check if the topic is empty
+	if high <= low {
+		log.DefaultLogger.Debug("Topic is empty or has only one message",
+			"topic", topic,
+			"partition", partition,
+			"low", low,
+			"high", high)
+
+		// Set to earliest offset (which is effectively the same as high in this case)
+		if setErr := reader.SetOffset(low); setErr != nil {
+			reader.Close()
+			log.DefaultLogger.Error("Unable to set offset to earliest for empty topic",
+				"error", setErr,
+				"topic", topic,
+				"partition", partition)
+			return nil, fmt.Errorf("unable to set offset to earliest for empty topic: %w", setErr)
+		}
+		log.DefaultLogger.Debug("Set offset to earliest for empty topic",
+			"topic", topic,
+			"partition", partition,
+			"offset", low)
+		return reader, nil
+	}
+
+	// Try to set the offset based on timestamp
+	log.DefaultLogger.Debug("Attempting to set offset at time",
+		"time", startTime.Format(time.RFC3339),
+		"topic", topic,
+		"partition", partition)
+
+	err := reader.SetOffsetAt(timeoutCtx, startTime)
+	if err != nil {
+		// If setting the offset by timestamp fails, log the error and try to use the earliest offset instead
+		log.DefaultLogger.Error("Failed to set offset at time, falling back to earliest offset",
+			"error", err,
+			"time", startTime.Format(time.RFC3339),
+			"topic", topic,
+			"partition", partition)
+
+		// Set the reader to the earliest offset as fallback
+		if setErr := reader.SetOffset(low); setErr != nil {
+			reader.Close()
+			log.DefaultLogger.Error("Unable to set offset to earliest after SetOffsetAt failed",
+				"error", setErr,
+				"topic", topic,
+				"partition", partition)
+			return nil, fmt.Errorf("unable to set offset to earliest after SetOffsetAt failed: %w", setErr)
+		}
+
+		log.DefaultLogger.Debug("Successfully set offset to earliest as fallback",
+			"topic", topic,
+			"partition", partition,
+			"offset", low)
+		return reader, nil
+	}
+
+	// Get the actual offset that was set for logging
+	offset := reader.Offset()
+	log.DefaultLogger.Debug("Offset set by timestamp",
+		"topic", topic,
+		"partition", partition,
+		"offset", offset,
+		"time", startTime.Format(time.RFC3339))
+
+	// If the offset is at the end of the topic (no messages found for the time range)
+	if offset >= high {
+		log.DefaultLogger.Debug("No messages found after specified time, setting to earliest offset",
+			"time", startTime.Format(time.RFC3339),
+			"topic", topic,
+			"partition", partition,
+			"offset", offset,
+			"highWatermark", high)
+
+		// Set to earliest offset instead
+		if setErr := reader.SetOffset(low); setErr != nil {
+			reader.Close()
+			log.DefaultLogger.Error("Unable to set offset to earliest when no messages found in time range",
+				"error", setErr,
+				"topic", topic,
+				"partition", partition)
+			return nil, fmt.Errorf("unable to set offset to earliest when no messages found in time range: %w", setErr)
+		}
+
+		log.DefaultLogger.Debug("Successfully set offset to earliest when no messages found in time range",
+			"topic", topic,
+			"partition", partition,
+			"offset", low)
+		return reader, nil
+	}
+
+	log.DefaultLogger.Debug("Successfully set offset based on time",
+		"topic", topic,
+		"partition", partition,
+		"offset", offset,
+		"time", startTime.Format(time.RFC3339))
+	return reader, nil
+}
+
 func (client *KafkaClient) ConsumerPull(ctx context.Context, reader *kafka.Reader) (KafkaMessage, error) {
 	var message KafkaMessage
 
+	log.DefaultLogger.Debug("Attempting to read message from Kafka",
+		"topic", reader.Config().Topic,
+		"partition", reader.Config().Partition)
+
+	// Start timing the read operation
+	readStart := time.Now()
 	msg, err := reader.ReadMessage(ctx)
+	readDuration := time.Since(readStart)
+
 	if err != nil {
+		if err == context.DeadlineExceeded {
+			log.DefaultLogger.Debug("Timeout reading message from Kafka",
+				"topic", reader.Config().Topic,
+				"partition", reader.Config().Partition,
+				"duration_ms", readDuration.Milliseconds())
+		} else {
+			log.DefaultLogger.Error("Error reading message from Kafka",
+				"error", err,
+				"topic", reader.Config().Topic,
+				"partition", reader.Config().Partition,
+				"duration_ms", readDuration.Milliseconds())
+		}
 		return message, fmt.Errorf("error reading message from Kafka: %w", err)
 	}
 
+	log.DefaultLogger.Debug("Successfully read message from Kafka",
+		"topic", reader.Config().Topic,
+		"partition", reader.Config().Partition,
+		"offset", msg.Offset,
+		"timestamp", msg.Time.Format(time.RFC3339),
+		"duration_ms", readDuration.Milliseconds(),
+		"message_size_bytes", len(msg.Value))
+
+	// Start timing the unmarshal operation
+	unmarshalStart := time.Now()
 	if err := json.Unmarshal(msg.Value, &message.Value); err != nil {
+		log.DefaultLogger.Error("Error unmarshalling message",
+			"error", err,
+			"topic", reader.Config().Topic,
+			"partition", reader.Config().Partition,
+			"offset", msg.Offset,
+			"message_size_bytes", len(msg.Value),
+			"message_preview", string(msg.Value[:min(len(msg.Value), 100)]))
 		return message, fmt.Errorf("error unmarshalling message: %w", err)
 	}
+	unmarshalDuration := time.Since(unmarshalStart)
 
 	message.Offset = msg.Offset
 	message.Timestamp = msg.Time
 
+	fieldCount := len(message.Value)
+	log.DefaultLogger.Debug("Successfully unmarshalled message",
+		"topic", reader.Config().Topic,
+		"partition", reader.Config().Partition,
+		"offset", msg.Offset,
+		"timestamp", msg.Time.Format(time.RFC3339),
+		"field_count", fieldCount,
+		"unmarshal_duration_ms", unmarshalDuration.Milliseconds())
+
 	return message, nil
+}
+
+// Helper function to get the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (client *KafkaClient) HealthCheck() error {
@@ -271,7 +476,7 @@ func (client *KafkaClient) HealthCheck() error {
 	// Log connection attempt with non-sensitive info
 	brokers := strings.Split(client.BootstrapServers, ",")
 	brokerCount := len(brokers)
-	log.Printf("[KAFKA DEBUG] Attempting health check connection to %d broker(s)", brokerCount)
+	log.DefaultLogger.Debug("Attempting health check connection", "brokerCount", brokerCount)
 
 	// It is better to try several times due to possible network issues
 	timeout := time.After(time.Duration(client.HealthcheckTimeout) * time.Millisecond)
@@ -343,14 +548,56 @@ func getKafkaLogger(level string) (kafka.LoggerFunc, kafka.LoggerFunc) {
 	switch strings.ToLower(level) {
 	case debugLogLevel:
 		logger = func(msg string, args ...interface{}) {
-			log.Printf("[KAFKA DEBUG] "+msg, args...)
+			// Convert variadic args to key-value pairs for Grafana logger
+			kvs := make([]interface{}, 0, len(args))
+			for i, arg := range args {
+				// For odd indices, use as value with auto-generated key
+				if i%2 == 0 {
+					kvs = append(kvs, fmt.Sprintf("arg%d", i), arg)
+				} else {
+					// For even indices, use previous value as key if it's a string
+					if key, ok := args[i-1].(string); ok {
+						kvs[len(kvs)-2] = key // Replace auto-generated key
+					}
+					kvs[len(kvs)-1] = arg // Keep the value
+				}
+			}
+			log.DefaultLogger.Debug("KAFKA: "+msg, kvs...)
 		}
 		errorLogger = func(msg string, args ...interface{}) {
-			log.Printf("[KAFKA ERROR] "+msg, args...)
+			// Convert variadic args to key-value pairs for Grafana logger
+			kvs := make([]interface{}, 0, len(args))
+			for i, arg := range args {
+				// For odd indices, use as value with auto-generated key
+				if i%2 == 0 {
+					kvs = append(kvs, fmt.Sprintf("arg%d", i), arg)
+				} else {
+					// For even indices, use previous value as key if it's a string
+					if key, ok := args[i-1].(string); ok {
+						kvs[len(kvs)-2] = key // Replace auto-generated key
+					}
+					kvs[len(kvs)-1] = arg // Keep the value
+				}
+			}
+			log.DefaultLogger.Error("KAFKA: "+msg, kvs...)
 		}
 	case errorLogLevel:
 		errorLogger = func(msg string, args ...interface{}) {
-			log.Printf("[KAFKA ERROR] "+msg, args...)
+			// Convert variadic args to key-value pairs for Grafana logger
+			kvs := make([]interface{}, 0, len(args))
+			for i, arg := range args {
+				// For odd indices, use as value with auto-generated key
+				if i%2 == 0 {
+					kvs = append(kvs, fmt.Sprintf("arg%d", i), arg)
+				} else {
+					// For even indices, use previous value as key if it's a string
+					if key, ok := args[i-1].(string); ok {
+						kvs[len(kvs)-2] = key // Replace auto-generated key
+					}
+					kvs[len(kvs)-1] = arg // Keep the value
+				}
+			}
+			log.DefaultLogger.Error("KAFKA: "+msg, kvs...)
 		}
 	}
 
