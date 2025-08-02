@@ -50,13 +50,16 @@ You can automatically configure the Kafka datasource using Grafana's provisionin
 
 ## Supported Data Format
 
-Your Kafka messages should contain simple JSON with numeric values:
+All data formats are now supported which allows the data-source plugin to be used in a variety of panels:
 
 ```json
 {
     "temperature": 23.5,
     "humidity": 65.2,
-    "pressure": 1013.25
+    "pressure": 1013.25,
+    "metra": {
+       "foo": "bar"
+    }
 }
 ```
 
