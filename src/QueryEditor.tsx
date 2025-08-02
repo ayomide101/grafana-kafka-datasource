@@ -1,6 +1,6 @@
 import { defaults } from 'lodash';
 import React, { ChangeEvent, PureComponent } from 'react';
-import { InlineField, InlineFieldRow, Input, Select } from '@grafana/ui';
+import { Combobox, InlineField, InlineFieldRow, Input } from '@grafana/ui';
 import { QueryEditorProps } from '@grafana/data';
 import { DataSource } from './datasource';
 import { defaultQuery, KafkaDataSourceOptions, KafkaQuery, AutoOffsetReset, TimestampMode } from './types';
@@ -64,17 +64,17 @@ export class QueryEditor extends PureComponent<Props> {
     return (
       <>
         <InlineFieldRow>
-          <InlineField label="Topic" labelWidth={10} tooltip="Kafka topic name">
+          <InlineField label="Topic" labelWidth={10} tooltip="Kafka topic name. Supports Grafana template variables (e.g., $variable or ${variable})">
             <Input
               id="query-editor-topic"
               value={topicName || ''}
               onChange={this.onTopicNameChange}
               type="text"
               width={20}
-              placeholder="Enter topic name"
+              placeholder="Enter topic name or use $variable"
             />
           </InlineField>
-          <InlineField label="Partition" labelWidth={10} tooltip="Kafka partition number">
+          <InlineField label="Partition" labelWidth={10} tooltip="Kafka partition number. Supports Grafana template variables (e.g., $variable or ${variable})">
             <Input
               id="query-editor-partition"
               value={partition}
@@ -88,8 +88,12 @@ export class QueryEditor extends PureComponent<Props> {
           </InlineField>
         </InlineFieldRow>
         <InlineFieldRow>
-          <InlineField label="Auto offset reset" labelWidth={20} tooltip="Starting offset to consume that can be from latest or last 100.">
-            <Select
+          <InlineField
+            label="Auto offset reset"
+            labelWidth={20}
+            tooltip="Starting offset to consume that can be from latest or last 100."
+          >
+            <Combobox
               width={22}
               value={autoOffsetReset}
               options={autoResetOffsets}
@@ -97,7 +101,7 @@ export class QueryEditor extends PureComponent<Props> {
             />
           </InlineField>
           <InlineField label="Timestamp Mode" labelWidth={20} tooltip="Timestamp of the kafka value to visualize.">
-            <Select
+            <Combobox
               width={25}
               value={timestampMode}
               options={timestampModes}

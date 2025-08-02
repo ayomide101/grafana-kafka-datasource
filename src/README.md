@@ -6,6 +6,7 @@ Visualize real-time streaming data from Apache Kafka directly in your Grafana da
 
 - Real-time monitoring of Kafka topics
 - Ability to query specific partitions
+- Support for Grafana template variables in topic names and partition numbers
 - Choose between "latest" or "last 100" messages
 - Timestamp modes: "Now" for real-time or "Message Timestamp" for event time
 - Simple JSON data format support
@@ -43,10 +44,12 @@ You can automatically configure the Kafka datasource using Grafana's provisionin
 1. Create a new dashboard panel
 2. Select your Kafka data source
 3. Configure the query:
-   - **Topic**: Your Kafka topic name
-   - **Partition**: Partition number (usually 0)
+   - **Topic**: Your Kafka topic name (supports Grafana template variables like `$topic` or `${topic}`)
+   - **Partition**: Partition number (usually 0, also supports template variables like `$partition`)
    - **Auto offset reset**: Choose "latest" for new data or "last 100" for recent history
    - **Timestamp Mode**: Use "Now" for real-time or "Message Timestamp" for event time
+
+   > **Using Template Variables**: You can use Grafana dashboard variables in both the Topic and Partition fields. This allows you to create dynamic dashboards where users can select different topics or partitions using dropdown menus. For example, if you have a dashboard variable called `topic`, you can use `$topic` in the Topic field.
 
 ## Supported Data Format
 
