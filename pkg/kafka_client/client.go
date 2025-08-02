@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
@@ -243,154 +244,187 @@ func (client *KafkaClient) NewStreamReader(
 	return reader, nil
 }
 
-func (client *KafkaClient) NewTimeRangeReader(ctx context.Context, topic string, partition int32, startTime time.Time) (*kafka.Reader, error) {
-	log.DefaultLogger.Debug("Creating time range reader",
+type offsetCache struct {
+	sync.RWMutex
+	entries map[string]int64 // key: "topic/partition/timestampUnix"
+}
+
+var cache = &offsetCache{
+	entries: make(map[string]int64),
+}
+
+func (c *offsetCache) Get(key string) (int64, bool) {
+	c.RLock()
+	defer c.RUnlock()
+	val, ok := c.entries[key]
+	return val, ok
+}
+
+func (c *offsetCache) Set(key string, value int64) {
+	c.Lock()
+	defer c.Unlock()
+	c.entries[key] = value
+}
+
+func (client *KafkaClient) calculateTimeOffset(conn *kafka.Conn, topic string, partition int32, t time.Time, low int64, high int64) (int64, error) {
+	cacheKey := fmt.Sprintf("%s/%d/%d", topic, partition, t.Unix())
+
+	if offset, ok := cache.Get(cacheKey); ok {
+		return offset, nil
+	}
+
+	offset, err := conn.ReadOffset(t)
+	if err != nil {
+		return -1, err
+	}
+
+	if offset == -1 {
+		cache.Set(cacheKey, high)
+		return high, nil
+	}
+	if offset < low {
+		cache.Set(cacheKey, low)
+		return low, nil
+	}
+	if offset > high {
+		cache.Set(cacheKey, high)
+		return high, nil
+	}
+
+	cache.Set(cacheKey, offset)
+	return offset, nil
+}
+
+func (client *KafkaClient) NewTimeRangeReader(ctx context.Context, topic string, partition int32, startTime, endTime time.Time) (*kafka.Reader, int64, error) {
+	const timeout = 15 * time.Second
+	logCtx := []interface{}{
 		"topic", topic,
 		"partition", partition,
-		"startTime", startTime.Format(time.RFC3339))
+		"startTime", startTime.Format(time.RFC3339),
+		"endTime", endTime.Format(time.RFC3339),
+	}
+	log.DefaultLogger.Debug("Creating time range reader", logCtx...)
 
 	if client.Dialer == nil {
-		log.DefaultLogger.Debug("Dialer not initialized, creating new connection")
 		if err := client.NewConnection(); err != nil {
-			log.DefaultLogger.Error("Failed to create connection", "error", err)
-			return nil, fmt.Errorf("failed to create connection: %w", err)
+			log.DefaultLogger.Error("Failed to create connection", append(logCtx, "error", err)...)
+			return nil, -1, fmt.Errorf("connection failed: %w", err)
 		}
-		log.DefaultLogger.Debug("Connection created successfully")
 	}
 
-	// Create a new reader
 	reader := client.newReader(topic, int(partition))
-	log.DefaultLogger.Debug("Created new reader", "topic", topic, "partition", partition)
+	log.DefaultLogger.Debug("Created reader instance", logCtx...)
 
-	// Create a context with a timeout for the SetOffsetAt call
-	// Use a longer timeout (10 seconds) for time-based queries as they might take longer
-	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	metaCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	log.DefaultLogger.Debug("Using extended timeout for time-based query", "timeout_seconds", 10)
 
-	// First check if the topic has any messages
-	firstBroker := strings.Split(client.BootstrapServers, ",")[0]
-	log.DefaultLogger.Debug("Dialing leader to check topic", "broker", firstBroker, "topic", topic, "partition", partition)
-	conn, dialErr := client.Dialer.DialLeader(timeoutCtx, network, firstBroker, topic, int(partition))
-	if dialErr != nil {
-		reader.Close()
-		log.DefaultLogger.Error("Unable to dial leader to check topic", "error", dialErr, "broker", firstBroker)
-		return nil, fmt.Errorf("unable to dial leader to check topic: %w", dialErr)
-	}
-
-	// Get the current offset range
-	log.DefaultLogger.Debug("Reading offsets", "topic", topic, "partition", partition)
-	low, high, readErr := conn.ReadOffsets()
-	if readErr != nil {
-		conn.Close()
-		reader.Close()
-		log.DefaultLogger.Error("Unable to read offsets", "error", readErr, "topic", topic, "partition", partition)
-		return nil, fmt.Errorf("unable to read offsets: %w", readErr)
-	}
-	conn.Close()
-	log.DefaultLogger.Debug("Read offsets successfully",
-		"topic", topic,
-		"partition", partition,
-		"low", low,
-		"high", high,
-		"messageCount", high-low)
-
-	// Check if the topic is empty
-	if high <= low {
-		log.DefaultLogger.Debug("Topic is empty or has only one message",
-			"topic", topic,
-			"partition", partition,
-			"low", low,
-			"high", high)
-
-		// Set to earliest offset (which is effectively the same as high in this case)
-		if setErr := reader.SetOffset(low); setErr != nil {
-			reader.Close()
-			log.DefaultLogger.Error("Unable to set offset to earliest for empty topic",
-				"error", setErr,
-				"topic", topic,
-				"partition", partition)
-			return nil, fmt.Errorf("unable to set offset to earliest for empty topic: %w", setErr)
-		}
-		log.DefaultLogger.Debug("Set offset to earliest for empty topic",
-			"topic", topic,
-			"partition", partition,
-			"offset", low)
-		return reader, nil
-	}
-
-	// Try to set the offset based on timestamp
-	log.DefaultLogger.Debug("Attempting to set offset at time",
-		"time", startTime.Format(time.RFC3339),
-		"topic", topic,
-		"partition", partition)
-
-	err := reader.SetOffsetAt(timeoutCtx, startTime)
+	broker := strings.Split(client.BootstrapServers, ",")[0]
+	conn, err := client.Dialer.DialLeader(metaCtx, "tcp", broker, topic, int(partition))
 	if err != nil {
-		// If setting the offset by timestamp fails, log the error and try to use the earliest offset instead
-		log.DefaultLogger.Error("Failed to set offset at time, falling back to earliest offset",
-			"error", err,
-			"time", startTime.Format(time.RFC3339),
-			"topic", topic,
-			"partition", partition)
+		reader.Close()
+		log.DefaultLogger.Error("Failed to dial leader", append(logCtx, "broker", broker, "error", err)...)
+		return nil, -1, fmt.Errorf("dial leader failed: %w", err)
+	}
+	defer conn.Close()
 
-		// Set the reader to the earliest offset as fallback
-		if setErr := reader.SetOffset(low); setErr != nil {
+	low, high, err := conn.ReadOffsets()
+	if err != nil {
+		reader.Close()
+		log.DefaultLogger.Error("Failed to read offsets", append(logCtx, "error", err)...)
+		return nil, -1, fmt.Errorf("read offsets failed: %w", err)
+	}
+	log.DefaultLogger.Debug("Partition offsets", append(logCtx, "low", low, "high", high)...)
+	if high <= low {
+		log.DefaultLogger.Debug("Empty partition, setting to low offset", append(logCtx, "offset", low)...)
+		if err := reader.SetOffset(low); err != nil {
 			reader.Close()
-			log.DefaultLogger.Error("Unable to set offset to earliest after SetOffsetAt failed",
-				"error", setErr,
-				"topic", topic,
-				"partition", partition)
-			return nil, fmt.Errorf("unable to set offset to earliest after SetOffsetAt failed: %w", setErr)
+			return nil, -1, fmt.Errorf("set offset failed: %w", err)
 		}
-
-		log.DefaultLogger.Debug("Successfully set offset to earliest as fallback",
-			"topic", topic,
-			"partition", partition,
-			"offset", low)
-		return reader, nil
+		return reader, high, nil
 	}
 
-	// Get the actual offset that was set for logging
-	offset := reader.Offset()
-	log.DefaultLogger.Debug("Offset set by timestamp",
-		"topic", topic,
-		"partition", partition,
-		"offset", offset,
-		"time", startTime.Format(time.RFC3339))
-
-	// If the offset is at the end of the topic (no messages found for the time range)
-	if offset >= high {
-		log.DefaultLogger.Debug("No messages found after specified time, setting to earliest offset",
-			"time", startTime.Format(time.RFC3339),
-			"topic", topic,
-			"partition", partition,
-			"offset", offset,
-			"highWatermark", high)
-
-		// Set to earliest offset instead
-		if setErr := reader.SetOffset(low); setErr != nil {
-			reader.Close()
-			log.DefaultLogger.Error("Unable to set offset to earliest when no messages found in time range",
-				"error", setErr,
-				"topic", topic,
-				"partition", partition)
-			return nil, fmt.Errorf("unable to set offset to earliest when no messages found in time range: %w", setErr)
-		}
-
-		log.DefaultLogger.Debug("Successfully set offset to earliest when no messages found in time range",
-			"topic", topic,
-			"partition", partition,
-			"offset", low)
-		return reader, nil
+	startOffset, err := client.calculateTimeOffset(conn, topic, partition, startTime, low, high)
+	if err != nil {
+		log.DefaultLogger.Warn("Start offset calculation failed, using low", append(logCtx, "error", err)...)
+		startOffset = low
 	}
 
-	log.DefaultLogger.Debug("Successfully set offset based on time",
-		"topic", topic,
-		"partition", partition,
-		"offset", offset,
-		"time", startTime.Format(time.RFC3339))
-	return reader, nil
+	endOffset, err := client.calculateTimeOffset(conn, topic, partition, endTime, low, high)
+	if err != nil {
+		log.DefaultLogger.Warn("End offset calculation failed, using high", append(logCtx, "error", err)...)
+		endOffset = high
+	}
+
+	if startOffset > endOffset {
+		log.DefaultLogger.Debug("Start offset after end offset, using low",
+			append(logCtx, "startOffset", startOffset, "endOffset", endOffset)...)
+		startOffset = low
+	}
+
+	if err := reader.SetOffset(startOffset); err != nil {
+		log.DefaultLogger.Warn("SetOffset failed, using low offset", append(logCtx, "error", err)...)
+		if err := reader.SetOffset(low); err != nil {
+			reader.Close()
+			return nil, -1, fmt.Errorf("fallback offset failed: %w", err)
+		}
+		startOffset = low
+	}
+
+	log.DefaultLogger.Debug("Reader initialized",
+		append(logCtx,
+			"startOffset", startOffset,
+			"endOffset", endOffset,
+			"messageCount", endOffset-startOffset,
+		)...)
+
+	return reader, endOffset, nil
+}
+
+func (client *KafkaClient) BatchPull(ctx context.Context, reader *kafka.Reader, size int, endOffset int64) ([]KafkaMessage, error) {
+	processed := make([]KafkaMessage, 0, size)
+	for i := 0; i < size; i++ {
+		msg, err := reader.ReadMessage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if endOffset != -1 && msg.Offset >= endOffset {
+			break
+		}
+		processed = append(processed, decodeMessages(msg))
+	}
+	return processed, nil
+}
+
+func (client *KafkaClient) AsyncBatchPull(ctx context.Context, reader *kafka.Reader, size int, ch chan<- []KafkaMessage) {
+	defer close(ch)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			msgs, err := client.BatchPull(ctx, reader, size, -1)
+			if err != nil {
+				return
+			}
+			ch <- msgs
+		}
+	}
+}
+
+func decodeMessages(msg kafka.Message) KafkaMessage {
+	return KafkaMessage{
+		Timestamp: msg.Time,
+		Value:     decodePayload(msg.Value),
+		Offset:    msg.Offset,
+	}
+}
+
+func decodePayload(value []byte) map[string]interface{} {
+	var message map[string]interface{}
+	if err := json.Unmarshal(value, &message); err != nil {
+		return nil
+	}
+	return message
 }
 
 func (client *KafkaClient) ConsumerPull(ctx context.Context, reader *kafka.Reader) (KafkaMessage, error) {
