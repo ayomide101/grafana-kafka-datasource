@@ -1,6 +1,6 @@
 import { defaults } from 'lodash';
 import React, { ChangeEvent, PureComponent } from 'react';
-import { Combobox, InlineField, InlineFieldRow, Input } from '@grafana/ui';
+import { Combobox, InlineField, InlineFieldRow, Input, Switch } from '@grafana/ui';
 import { QueryEditorProps } from '@grafana/data';
 import { DataSource } from './datasource';
 import { defaultQuery, KafkaDataSourceOptions, KafkaQuery, AutoOffsetReset, TimestampMode } from './types';
@@ -57,9 +57,23 @@ export class QueryEditor extends PureComponent<Props> {
     onRunQuery();
   };
 
+  onStreamingChanged = (event: React.FormEvent<HTMLInputElement>) => {
+    const { onChange, query, onRunQuery } = this.props;
+    onChange({ ...query, streaming: event.currentTarget.checked });
+    onRunQuery();
+  };
+
+  onMaxMessagesChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const { onChange, query, onRunQuery } = this.props;
+    const value = parseInt(event.target.value, 10);
+    const maxMessages = (isNaN(value) || value < 1) ? undefined : value;
+    onChange({ ...query, maxMessages });
+    onRunQuery();
+  };
+
   render() {
     const query = defaults(this.props.query, defaultQuery);
-    const { topicName, partition, autoOffsetReset, timestampMode } = query;
+    const { topicName, partition, autoOffsetReset, timestampMode, streaming, maxMessages } = query;
 
     return (
       <>
@@ -106,6 +120,34 @@ export class QueryEditor extends PureComponent<Props> {
               value={timestampMode}
               options={timestampModes}
               onChange={(value) => this.onTimestampModeChanged(value.value!)}
+            />
+          </InlineField>
+        </InlineFieldRow>
+        <InlineFieldRow>
+          <InlineField 
+            label="Enable Streaming" 
+            labelWidth={20} 
+            tooltip="Enable continuous streaming of data from Kafka. When disabled, a fixed set of messages will be fetched once."
+          >
+            <Switch
+              value={streaming}
+              onChange={this.onStreamingChanged}
+            />
+          </InlineField>
+          <InlineField
+            label="Max Messages"
+            labelWidth={20}
+            tooltip="Maximum number of messages to fetch (overrides data source setting). Leave empty to use data source default."
+          >
+            <Input
+              id="query-editor-max-messages"
+              value={maxMessages === undefined ? '' : maxMessages}
+              onChange={this.onMaxMessagesChange}
+              type="number"
+              width={15}
+              min={1}
+              step={10}
+              placeholder="Default"
             />
           </InlineField>
         </InlineFieldRow>

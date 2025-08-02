@@ -118,9 +118,13 @@ type queryModel struct {
 	Partition       int32  `json:"partition"`
 	AutoOffsetReset string `json:"autoOffsetReset"`
 	TimestampMode   string `json:"timestampMode"`
+	Streaming       bool   `json:"streaming"`
+	MaxMessages     *int   `json:"maxMessages,omitempty"`
 }
 
-func (d *KafkaDatasource) query(_ context.Context, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
+func (d *KafkaDatasource) query(ctx context.Context, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
+	startTime := time.Now()
+
 	response := backend.DataResponse{}
 	var qm queryModel
 	response.Error = json.Unmarshal(query.JSON, &qm)
@@ -129,15 +133,240 @@ func (d *KafkaDatasource) query(_ context.Context, pCtx backend.PluginContext, q
 		return response
 	}
 
+	// If streaming is enabled, return a minimal response as streaming will be handled separately
+	if qm.Streaming {
+		frame := data.NewFrame("response")
+		frame.Fields = append(frame.Fields,
+			data.NewField("time", nil, []time.Time{query.TimeRange.From, query.TimeRange.To}),
+			data.NewField("values", nil, []int64{0, 0}),
+		)
+		response.Frames = append(response.Frames, frame)
+		return response
+	}
+
+	// For non-streaming mode, fetch data from Kafka
+	if err := d.client.NewConnection(); err != nil {
+		log.DefaultLogger.Error("Creating new Kafka connection error", "error", err)
+		response.Error = err
+		return response
+	}
+
+	exists, err := d.client.IsTopicExists(ctx, qm.Topic)
+	if err != nil {
+		log.DefaultLogger.Error("Checking kafka topic error", "error", err)
+		response.Error = err
+		return response
+	}
+
+	if !exists {
+		log.DefaultLogger.Debug("Topic not found", "topic", qm.Topic)
+		response.Error = fmt.Errorf("topic not found: %s", qm.Topic)
+		return response
+	}
+
+	reader, err := d.client.NewStreamReader(ctx, qm.Topic, qm.Partition, qm.AutoOffsetReset)
+	if err != nil {
+		log.DefaultLogger.Error("Failed to create stream reader", "error", err)
+		response.Error = err
+		return response
+	}
+	defer reader.Close()
+
 	frame := data.NewFrame("response")
 
-	frame.Fields = append(frame.Fields,
-		data.NewField("time", nil, []time.Time{query.TimeRange.From, query.TimeRange.To}),
-		data.NewField("values", nil, []int64{0, 0}),
-	)
+	// Get the max messages setting from the data source or query
+	maxMessages := 50 // Default value
+
+	// Check if the query has a max messages setting
+	if qm.MaxMessages != nil && *qm.MaxMessages > 0 {
+		maxMessages = *qm.MaxMessages
+	} else {
+		// Try to get the data source setting
+		var jsonData map[string]interface{}
+		if err := json.Unmarshal(pCtx.DataSourceInstanceSettings.JSONData, &jsonData); err == nil {
+			if dsMaxMessages, ok := jsonData["maxMessages"].(float64); ok && dsMaxMessages > 0 {
+				maxMessages = int(dsMaxMessages)
+			}
+		}
+	}
+	// Minimum number of messages to collect before returning
+	const minMessages = 5
+	// Number of messages that's enough for visualization
+	const targetMessages = 20
+
+	timeValues := make([]time.Time, 0, maxMessages)
+
+	// Maps to track all field keys and their types
+	allFields := make(map[string]string) // key -> type
+	messages := make([]map[string]interface{}, 0, maxMessages)
+
+	queryTimeout := time.After(2 * time.Second)
+	messageCount := 0
+
+	// First pass: collect all messages and identify all fields and their types
+	for messageCount < maxMessages {
+		select {
+		case <-queryTimeout:
+			log.DefaultLogger.Debug("Query timeout reached", "messageCount", messageCount)
+			break
+		default:
+			// Reduce per-message timeout to 100ms
+			msgCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			msg, err := d.client.ConsumerPull(msgCtx, reader)
+			cancel()
+
+			if err != nil {
+				log.DefaultLogger.Debug("Error or timeout fetching message", "error", err, "messageCount", messageCount)
+				break
+			}
+
+			var frameTime time.Time
+			if qm.TimestampMode == "now" {
+				frameTime = time.Now()
+			} else {
+				frameTime = msg.Timestamp
+			}
+			timeValues = append(timeValues, frameTime)
+
+			// Store the message for second pass
+			messages = append(messages, msg.Value)
+
+			// Record all field keys and their types
+			for key, value := range msg.Value {
+				// Only record the type if we haven't seen this field before
+				// or if we've seen it but it was null
+				if existingType, exists := allFields[key]; !exists || existingType == "" {
+					switch value.(type) {
+					case float64:
+						allFields[key] = "float64"
+					case string:
+						allFields[key] = "string"
+					case bool:
+						allFields[key] = "bool"
+					case nil:
+						// For null values, we'll use string type but mark it as empty
+						// so it can be overridden if we find a non-null value later
+						if !exists {
+							allFields[key] = ""
+						}
+					default:
+						// For complex types, store as JSON string
+						allFields[key] = "string"
+					}
+				}
+			}
+
+			messageCount++
+
+			// Early return if we have enough messages for visualization
+			// but ensure we have at least minMessages
+			if messageCount >= targetMessages && messageCount >= minMessages {
+				log.DefaultLogger.Debug("Collected enough messages for visualization", "messageCount", messageCount)
+				break
+			}
+		}
+	}
+
+	// If no messages were collected, return early
+	if len(messages) == 0 {
+		frame.Fields = append(frame.Fields,
+			data.NewField("time", nil, []time.Time{query.TimeRange.From, query.TimeRange.To}),
+			data.NewField("values", nil, []int64{0, 0}),
+		)
+		response.Frames = append(response.Frames, frame)
+
+		// Log query execution time
+		queryDuration := time.Since(startTime)
+		log.DefaultLogger.Debug("Query execution completed with no messages", "duration_ms", queryDuration.Milliseconds())
+
+		return response
+	}
+
+	// Log the number of messages and fields for debugging
+	log.DefaultLogger.Debug("Collected messages",
+		"count", len(messages),
+		"fieldCount", len(allFields),
+		"timeValues", len(timeValues))
+
+	// Initialize field arrays with the correct length
+	fieldValues := make(map[string]interface{})
+	for key, fieldType := range allFields {
+		// Default to string type for null fields
+		if fieldType == "" {
+			fieldType = "string"
+			allFields[key] = "string"
+		}
+
+		switch fieldType {
+		case "float64":
+			fieldValues[key] = make([]float64, len(messages))
+		case "string":
+			fieldValues[key] = make([]string, len(messages))
+		case "bool":
+			fieldValues[key] = make([]bool, len(messages))
+		}
+	}
+
+	// Second pass: populate field arrays with values from messages
+	for i, msg := range messages {
+		for key, fieldType := range allFields {
+			value, exists := msg[key]
+
+			if !exists {
+				// Field doesn't exist in this message, use default value
+				continue // The arrays are already initialized with zero values
+			}
+
+			switch fieldType {
+			case "float64":
+				if v, ok := value.(float64); ok {
+					fieldValues[key].([]float64)[i] = v
+				}
+			case "string":
+				if v, ok := value.(string); ok {
+					fieldValues[key].([]string)[i] = v
+				} else if value == nil {
+					fieldValues[key].([]string)[i] = "null"
+				} else {
+					// Convert complex types to JSON string
+					jsonBytes, err := json.Marshal(value)
+					if err != nil {
+						log.DefaultLogger.Error("Error marshalling complex value", "error", err)
+						continue
+					}
+					fieldValues[key].([]string)[i] = string(jsonBytes)
+				}
+			case "bool":
+				if v, ok := value.(bool); ok {
+					fieldValues[key].([]bool)[i] = v
+				}
+			}
+		}
+	}
+
+	frame.Fields = append(frame.Fields, data.NewField("time", nil, timeValues))
+	for key, values := range fieldValues {
+		switch allFields[key] {
+		case "float64":
+			frame.Fields = append(frame.Fields, data.NewField(key, nil, values.([]float64)))
+		case "string":
+			frame.Fields = append(frame.Fields, data.NewField(key, nil, values.([]string)))
+		case "bool":
+			frame.Fields = append(frame.Fields, data.NewField(key, nil, values.([]bool)))
+		}
+	}
+
+	// Log query execution time and message processing rate
+	queryDuration := time.Since(startTime)
+	messagesPerSecond := float64(messageCount) / queryDuration.Seconds()
+
+	log.DefaultLogger.Debug("Query execution completed",
+		"duration_ms", queryDuration.Milliseconds(),
+		"messageCount", messageCount,
+		"messagesPerSecond", messagesPerSecond,
+		"fieldCount", len(allFields))
 
 	response.Frames = append(response.Frames, frame)
-
 	return response
 }
 
@@ -210,8 +439,7 @@ func (d *KafkaDatasource) SubscribeStream(ctx context.Context, req *backend.Subs
 }
 
 func (d *KafkaDatasource) RunStream(ctx context.Context, req *backend.RunStreamRequest, sender *backend.StreamSender) error {
-	log.DefaultLogger.Debug("RunStream called",
-		"path", req.Path)
+	log.DefaultLogger.Debug("RunStream called", "path", req.Path)
 
 	var qm queryModel
 	err := json.Unmarshal(req.Data, &qm)
@@ -225,34 +453,149 @@ func (d *KafkaDatasource) RunStream(ctx context.Context, req *backend.RunStreamR
 		return fmt.Errorf("failed to create stream reader: %w", err)
 	}
 	defer reader.Close()
+
+	// Performance tracking variables
+	startTime := time.Now()
+	messageCount := 0
+	lastLogTime := startTime
+	const logInterval = 30 * time.Second // Log stats every 30 seconds
+	const logMessageFrequency = 100      // Log only every 100 messages
+
+	// Get the max messages setting from the data source or query
+	maxMessages := 50 // Default value
+
+	// Check if the query has a max messages setting
+	if qm.MaxMessages != nil && *qm.MaxMessages > 0 {
+		maxMessages = *qm.MaxMessages
+	} else {
+		// Try to get the data source setting
+		var jsonData map[string]interface{}
+		if err := json.Unmarshal(req.PluginContext.DataSourceInstanceSettings.JSONData, &jsonData); err == nil {
+			if dsMaxMessages, ok := jsonData["maxMessages"].(float64); ok && dsMaxMessages > 0 {
+				maxMessages = int(dsMaxMessages)
+			}
+		}
+	}
+
+	log.DefaultLogger.Debug("Stream configured",
+		"topic", qm.Topic,
+		"maxMessages", maxMessages)
+
+	// Error handling variables
+	const maxConsecutiveErrors = 5
+	const initialBackoff = 100 * time.Millisecond
+	const maxBackoff = 2 * time.Second
+	consecutiveErrors := 0
+	currentBackoff := initialBackoff
+
 	for {
 		select {
 		case <-ctx.Done():
-			log.DefaultLogger.Debug("Context done, finish streaming", "path", req.Path)
+			// Calculate final stats
+			duration := time.Since(startTime)
+			messagesPerSecond := float64(messageCount) / duration.Seconds()
+
+			log.DefaultLogger.Debug("Stream finished",
+				"path", req.Path,
+				"topic", qm.Topic,
+				"duration_s", duration.Seconds(),
+				"messageCount", messageCount,
+				"messagesPerSecond", messagesPerSecond)
 			return nil
+
 		default:
-			msg, err := d.client.ConsumerPull(ctx, reader)
+			// Use timeout context for message pulls to avoid blocking
+			msgCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			msg, err := d.client.ConsumerPull(msgCtx, reader)
+			cancel()
+
 			if err != nil {
-				return err
+				// Handle errors with backoff/retry
+				consecutiveErrors++
+
+				// Only log every few errors to avoid flooding logs
+				if consecutiveErrors == 1 || consecutiveErrors%5 == 0 {
+					log.DefaultLogger.Debug("Error pulling message",
+						"error", err,
+						"consecutiveErrors", consecutiveErrors,
+						"backoff_ms", currentBackoff.Milliseconds())
+				}
+
+				// If too many consecutive errors, return with error
+				if consecutiveErrors > maxConsecutiveErrors {
+					return fmt.Errorf("too many consecutive errors (%d): %w", consecutiveErrors, err)
+				}
+
+				// Apply backoff with exponential increase (capped)
+				time.Sleep(currentBackoff)
+				if currentBackoff < maxBackoff {
+					currentBackoff *= 2
+				}
+
+				continue
 			}
+
+			// Reset error counters on success
+			consecutiveErrors = 0
+			currentBackoff = initialBackoff
+
+			// Increment message counter
+			messageCount++
+
+			// Check if we've reached the max messages limit
+			if messageCount >= maxMessages {
+				duration := time.Since(startTime)
+				messagesPerSecond := float64(messageCount) / duration.Seconds()
+
+				log.DefaultLogger.Debug("Stream reached max messages limit",
+					"path", req.Path,
+					"topic", qm.Topic,
+					"maxMessages", maxMessages,
+					"duration_s", duration.Seconds(),
+					"messagesPerSecond", messagesPerSecond)
+				return nil
+			}
+
+			// Create frame for this message
 			frame := data.NewFrame("response")
 			frame.Fields = append(frame.Fields,
 				data.NewField("time", nil, make([]time.Time, 1)),
 			)
-			var frame_time time.Time
-			if qm.TimestampMode == "now" {
-				frame_time = time.Now()
-			} else {
-				frame_time = msg.Timestamp
-			}
-			log.DefaultLogger.Debug("Message received",
-				"topic", qm.Topic,
-				"partition", qm.Partition,
-				"offset", msg.Offset,
-				"timestamp", frame_time,
-				"fieldCount", len(msg.Value))
 
-			frame.Fields[0].Set(0, frame_time)
+			// Determine timestamp based on mode
+			var frameTime time.Time
+			if qm.TimestampMode == "now" {
+				frameTime = time.Now()
+			} else {
+				frameTime = msg.Timestamp
+			}
+
+			// Only log every Nth message to reduce log volume
+			if messageCount == 1 || messageCount%logMessageFrequency == 0 {
+				log.DefaultLogger.Debug("Message received",
+					"topic", qm.Topic,
+					"partition", qm.Partition,
+					"offset", msg.Offset,
+					"messageCount", messageCount,
+					"fieldCount", len(msg.Value))
+			}
+
+			// Log periodic performance stats
+			now := time.Now()
+			if now.Sub(lastLogTime) >= logInterval {
+				duration := now.Sub(startTime)
+				messagesPerSecond := float64(messageCount) / duration.Seconds()
+
+				log.DefaultLogger.Debug("Stream performance stats",
+					"topic", qm.Topic,
+					"duration_s", duration.Seconds(),
+					"messageCount", messageCount,
+					"messagesPerSecond", messagesPerSecond)
+
+				lastLogTime = now
+			}
+
+			frame.Fields[0].Set(0, frameTime)
 
 			cnt := 1
 			for key, value := range msg.Value {
@@ -289,6 +632,7 @@ func (d *KafkaDatasource) RunStream(ctx context.Context, req *backend.RunStreamR
 			err = sender.SendFrame(frame, data.IncludeAll)
 			if err != nil {
 				log.DefaultLogger.Error("Error sending frame", "error", err)
+				// Continue processing even if sending fails
 				continue
 			}
 		}

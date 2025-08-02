@@ -38,23 +38,31 @@ export class DataSource extends DataSourceWithBackend<KafkaQuery, KafkaDataSourc
       .filter(this.filterQuery)
       .map(query => {
         const interpolatedQuery = this.applyTemplateVariables(query, request.scopedVars);
-        
-        return getGrafanaLiveSrv().getDataStream({
-          addr: {
-            scope: LiveChannelScope.DataSource,
-            namespace: this.uid,
-            path: `${interpolatedQuery.topicName}-${interpolatedQuery.partition}-${interpolatedQuery.autoOffsetReset}`,
-            data: interpolatedQuery,
-          },
-        }).pipe(
-          catchError(err => {
-            console.error('Stream error:', err);
-            return throwError(() => ({
-              message: `Error connecting to Kafka topic ${interpolatedQuery.topicName}: ${err.message}`,
-              status: 'error'
-            }));
-          })
-        );
+        if (interpolatedQuery.streaming) {
+          // Use streaming mode (Grafana Live)
+          return getGrafanaLiveSrv().getDataStream({
+            addr: {
+              scope: LiveChannelScope.DataSource,
+              namespace: this.uid,
+              path: `${interpolatedQuery.topicName}-${interpolatedQuery.partition}-${interpolatedQuery.autoOffsetReset}`,
+              data: interpolatedQuery,
+            },
+          }).pipe(
+            catchError(err => {
+              console.error('Stream error:', err);
+              return throwError(() => ({
+                message: `Error connecting to Kafka topic ${interpolatedQuery.topicName}: ${err.message}`,
+                status: 'error'
+              }));
+            })
+          );
+        } else {
+          // Use non-streaming mode (regular query)
+          return super.query({
+            ...request,
+            targets: [interpolatedQuery],
+          });
+        }
       });
 
     return merge(...observables);
